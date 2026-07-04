@@ -15,6 +15,7 @@ Run with:
 
 import time
 import re
+import textwrap
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
@@ -149,6 +150,21 @@ def predict(model, ids, mask, pix):
     return pred, probs
 
 
+def format_token_label(tok, width=7):
+    """
+    Cleans up a raw CLIP BPE token for display: strips the `</w>`
+    end-of-word marker (it's a tokenizer artifact, not meaningful content)
+    and wraps anything longer than `width` characters onto two lines so
+    labels stay readable at 0-45 degree rotation instead of needing a steep
+    75 degree rotation to avoid overlapping.
+    """
+    clean = tok.replace("</w>", "")
+    if not clean:
+        return tok  # fall back to raw token if cleaning empties it out
+    wrapped = textwrap.wrap(clean, width=width, break_long_words=True)
+    return "\n".join(wrapped[:2]) if wrapped else clean
+
+
 def show_probs(labels_map, probs):
     """Renders custom Beacon-gradient bars (sorted high to low) instead of st.progress."""
     order = np.argsort(-probs)
@@ -169,6 +185,14 @@ def plot_token_beeswarm(tokens, contrib_per_dim, activation_per_dim, max_tokens=
     activation strength — the closest honest analogue to a SHAP summary plot
     for a single instance, since a true beeswarm needs many samples per
     feature and here we only have one.
+
+    The x-axis is clipped to the 2nd-98th percentile of the plotted values
+    (with padding) rather than auto-scaling to the full min/max. A single
+    outlier dimension in one token can otherwise stretch the axis so far
+    that every other token's spread collapses to a visually flat line, even
+    though the underlying values are meaningful. Clipping only affects the
+    axis limits — points beyond the range are still drawn, just off-canvas
+    at the edges, so no data is discarded or altered.
     """
     total_abs = np.abs(contrib_per_dim).sum(axis=1)
     order = np.argsort(-total_abs)[:max_tokens]
@@ -179,15 +203,28 @@ def plot_token_beeswarm(tokens, contrib_per_dim, activation_per_dim, max_tokens=
     cmap = style.BEACON_CMAP
 
     rng = np.random.default_rng(0)
+    plotted_x = []
     for row, tok_idx in enumerate(order):
         x = contrib_per_dim[tok_idx]
         c = activation_per_dim[tok_idx]
         jitter = rng.uniform(-0.35, 0.35, size=len(x))
         ax.scatter(x, np.full_like(x, row) + jitter, c=c, cmap=cmap, norm=norm, s=12, alpha=0.75, linewidths=0)
+        plotted_x.append(x)
+
+    # Percentile-based x-limits so one outlier dimension doesn't flatten the
+    # rest of the swarm visually.
+    all_plotted_x = np.concatenate(plotted_x) if plotted_x else np.array([0.0])
+    lo, hi = np.percentile(all_plotted_x, [2, 98])
+    if hi <= lo:
+        lo, hi = all_plotted_x.min(), all_plotted_x.max()
+    if hi <= lo:
+        lo, hi = -1e-6, 1e-6
+    pad = (hi - lo) * 0.2
+    ax.set_xlim(lo - pad, hi + pad)
 
     ax.axvline(0, color=style.PAPER_BORDER, linewidth=1)
     ax.set_yticks(range(len(order)))
-    ax.set_yticklabels([tokens[i] for i in order], fontfamily="monospace")
+    ax.set_yticklabels([format_token_label(tokens[i], width=10) for i in order], fontfamily="monospace")
     ax.set_xlabel("Gradient × Input contribution")
     ax.set_title("Text token attribution", loc="left", fontsize=11, fontweight="bold")
     style.apply_chart_style(fig, ax)
@@ -208,6 +245,12 @@ def plot_token_beeswarm(tokens, contrib_per_dim, activation_per_dim, max_tokens=
 
 
 def show_xai_panel(model, tokenizer, ids, mask, pix, pil_image, pred_class, container):
+    """
+    Renders the Grad-CAM + token-attribution panel for one stage, and
+    returns the raw `compute_explanations` result dict so the caller can
+    stash it for cross-stage comparison (see the divergence check after
+    stage 3 below).
+    """
     result = compute_explanations(model, tokenizer, ids, mask, pix, device, target_class=pred_class)
     grid = result["grid"]
     tokens = result["tokens"]
@@ -221,21 +264,53 @@ def show_xai_panel(model, tokenizer, ids, mask, pix, pil_image, pred_class, cont
         '<div class="cc-eyebrow" style="margin-top:0.5rem;">WHY THIS PREDICTION</div>',
         unsafe_allow_html=True,
     )
-    c1, c2 = container.columns([1, 1])
 
-    c1.image(overlay, caption="Grad-CAM — image regions driving the prediction", use_container_width=True)
+    container.image(overlay, caption="Grad-CAM — image regions driving the prediction", use_container_width=True)
 
-    fig, ax = plt.subplots(figsize=(max(4, len(tokens) * 0.45), 3))
-    bar_colors = [style.BEACON_CMAP(0.15 + 0.75 * v) for v in importance]
-    ax.bar(range(len(tokens)), importance, color=bar_colors)
-    ax.set_xticks(range(len(tokens)))
-    ax.set_xticklabels(tokens, rotation=75, fontsize=8, fontfamily="monospace")
+    # Cap to the top-N most important tokens rather than plotting the whole
+    # sequence (which can be 30-40+ tokens for a full caption). Uncapped, the
+    # figure width (scaled per-token) balloons far past the fixed height,
+    # producing an extreme aspect ratio that gets squashed when scaled to
+    # fit the container width.
+    MAX_BAR_TOKENS = 15
+    if len(tokens) > MAX_BAR_TOKENS:
+        keep_idx = np.sort(np.argsort(-importance)[:MAX_BAR_TOKENS])
+    else:
+        keep_idx = np.arange(len(tokens))
+    display_tokens = [tokens[i] for i in keep_idx]
+    display_importance = importance[keep_idx]
+
+    fig, ax = plt.subplots(figsize=(max(6, len(display_tokens) * 0.6), 3.8))
+    bar_colors = [style.BEACON_CMAP(0.15 + 0.75 * v) for v in display_importance]
+    ax.bar(range(len(display_tokens)), display_importance, color=bar_colors)
+    ax.set_xticks(range(len(display_tokens)))
+    ax.set_xticklabels([])  # hide default single-row labels; drawn manually below, staggered
+
+    # Draw labels in two staggered rows (even index near the axis, odd index
+    # further below) instead of one crowded row. This is what actually
+    # prevents overlap for short adjacent tokens — word-wrapping alone only
+    # helps long tokens, and rotation alone still collides at this density.
+    for i, tok in enumerate(display_tokens):
+        label = format_token_label(tok, width=10).replace("\n", "")
+        y_offset = -0.05 if i % 2 == 0 else -0.16
+        ax.text(
+            i, y_offset, label,
+            transform=ax.get_xaxis_transform(),
+            ha="center", va="top",
+            fontsize=8, fontfamily="monospace",
+            color=style.PAPER_TEXT_MUTED,
+        )
+
     ax.set_ylabel("Saliency")
-    ax.set_title("Text token importance", loc="left", fontsize=11, fontweight="bold")
+    title = "Text token importance"
+    if len(tokens) > MAX_BAR_TOKENS:
+        title += f" (top {MAX_BAR_TOKENS} of {len(tokens)} shown)"
+    ax.set_title(title, loc="left", fontsize=11, fontweight="bold")
     ax.set_ylim(0, 1.05)
     style.apply_chart_style(fig, ax)
     fig.tight_layout()
-    c2.pyplot(fig, use_container_width=True)
+    fig.subplots_adjust(bottom=0.32)  # must come AFTER tight_layout, which would otherwise reset it
+    container.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
     # SHAP-beeswarm-style view of the same text attribution, full width
@@ -247,13 +322,71 @@ def show_xai_panel(model, tokenizer, ids, mask, pix, pil_image, pred_class, cont
     if len(tokens) > 0:
         top_k = min(3, len(tokens))
         top_idx = np.argsort(-importance)[:top_k]
-        top_words = [tokens[i] for i in top_idx if importance[i] > 0]
+        top_words = [format_token_label(tokens[i], width=99).replace("\n", "") for i in top_idx if importance[i] > 0]
         if top_words:
             container.markdown(
                 f'<span class="cc-latency">Most influential words: '
                 f'<b style="color:{style.INK_TEXT} !important;">{", ".join(top_words)}</b></span>',
                 unsafe_allow_html=True,
             )
+
+    return result
+
+
+def show_divergence_check(stage_results, container):
+    """
+    Small diagnostic panel: compares the token-importance vectors across
+    whichever stages ran (informativeness / humanitarian / damage) using
+    cosine similarity, so you can directly verify the three stages produce
+    genuinely different attributions rather than eyeballing separate plots.
+
+    stage_results: dict like {"Informativeness": result, "Humanitarian": result, ...}
+    where each result is a dict returned by compute_explanations (must share
+    the same `tokens`, since all stages run on the same input encoding).
+
+    Similarity near 1.0 for a pair means their importance vectors are nearly
+    identical — worth double-checking that those two stages are really
+    loading different checkpoints. Lower values indicate the stages are
+    genuinely attending to different words for their predictions.
+    """
+    names = list(stage_results.keys())
+    if len(names) < 2:
+        return
+
+    def cosine_sim(a, b):
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+        return float(np.dot(a, b) / denom)
+
+    container.markdown(
+        '<div class="cc-eyebrow" style="margin-top:0.5rem;">CROSS-MODEL DIVERGENCE CHECK</div>',
+        unsafe_allow_html=True,
+    )
+
+    rows_html = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            name_a, name_b = names[i], names[j]
+            imp_a = stage_results[name_a]["importance"]
+            imp_b = stage_results[name_b]["importance"]
+            if len(imp_a) != len(imp_b):
+                rows_html.append(
+                    f'<div class="cc-latency">{name_a} vs {name_b}: token counts differ '
+                    f'({len(imp_a)} vs {len(imp_b)}), skipping comparison.</div>'
+                )
+                continue
+            sim = cosine_sim(imp_a, imp_b)
+            flag = " — nearly identical, worth checking these load different checkpoints" if sim > 0.98 else ""
+            rows_html.append(
+                f'<div class="cc-latency">{name_a} vs {name_b}: cosine similarity = {sim:.3f}{flag}</div>'
+            )
+
+    container.markdown("".join(rows_html), unsafe_allow_html=True)
+    container.caption(
+        "Similarity close to 1.0 means two stages are weighting the same words almost identically. "
+        "Lower values confirm each model is genuinely attending to different parts of the text."
+    )
 
 
 if run_button:
@@ -283,6 +416,8 @@ if run_button:
 
     st.image(pil_image, caption="Input image", width=320)
 
+    stage_results = {}
+
     # --- Stage 1: Informativeness -------------------------------------------------
     try:
         info_model = get_informativeness_model(info_ckpt, device)
@@ -297,7 +432,7 @@ if run_button:
     st.markdown(style.card_open("STAGE 1 / 3", "Informativeness", strip_color), unsafe_allow_html=True)
     show_probs(INFORMATIVE_LABELS, info_probs)
     if show_xai:
-        show_xai_panel(info_model, processor.tokenizer, ids, mask, pix, pil_image, info_pred, st)
+        stage_results["Informativeness"] = show_xai_panel(info_model, processor.tokenizer, ids, mask, pix, pil_image, info_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
 
     if not is_informative and not force_continue:
@@ -322,7 +457,7 @@ if run_button:
     st.markdown(style.card_open("STAGE 2 / 3", "Humanitarian Category", style.result_color(human_severity)), unsafe_allow_html=True)
     show_probs(HUMANITARIAN_LABELS, human_probs)
     if show_xai:
-        show_xai_panel(human_model, processor.tokenizer, ids, mask, pix, pil_image, human_pred, st)
+        stage_results["Humanitarian"] = show_xai_panel(human_model, processor.tokenizer, ids, mask, pix, pil_image, human_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
 
     # --- Stage 3: Damage severity ----------------------------------------------
@@ -337,8 +472,13 @@ if run_button:
     st.markdown(style.card_open("STAGE 3 / 3", "Damage Severity", style.result_color(damage_severity_map.get(damage_pred, 0.5))), unsafe_allow_html=True)
     show_probs(DAMAGE_LABELS, damage_probs)
     if show_xai:
-        show_xai_panel(damage_model, processor.tokenizer, ids, mask, pix, pil_image, damage_pred, st)
+        stage_results["Damage Severity"] = show_xai_panel(damage_model, processor.tokenizer, ids, mask, pix, pil_image, damage_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
+
+    if show_xai and len(stage_results) >= 2:
+        st.markdown(style.card_open("DIAGNOSTIC", "Model Attribution Comparison", style.CURRENT), unsafe_allow_html=True)
+        show_divergence_check(stage_results, st)
+        st.markdown(style.card_close(), unsafe_allow_html=True)
 
     st.markdown(
         f'<span class="cc-latency">✓ Done — total latency: {(time.time() - t0)*1000:.0f} ms</span>',
