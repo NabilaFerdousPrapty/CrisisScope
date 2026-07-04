@@ -1,0 +1,8 @@
+streamlit>=1.33
+torch>=2.1
+torchvision>=0.16
+transformers>=4.40
+peft>=0.10
+Pillow
+numpy
+matplotlib

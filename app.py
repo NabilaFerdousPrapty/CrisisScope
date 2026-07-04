@@ -1,0 +1,346 @@
+"""
+Crisis-CLIP Streamlit demo.
+
+Pipeline:
+  1. User uploads an image + enters social-media-style text.
+  2. Informativeness model gates the rest of the pipeline (matches your
+     CrisisMMD task design: non-informative posts aren't analyzed further,
+     but you can override this in the sidebar for demo purposes).
+  3. If informative: humanitarian-category (5-class) and damage-severity
+     (3-class) models run, each with live Grad-CAM + text-token XAI.
+
+Run with:
+    streamlit run app.py
+"""
+
+import time
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+import streamlit as st
+import torch
+from PIL import Image
+from transformers import CLIPProcessor
+
+def clean_social_text(text):
+    text = text.lower()
+
+    # Remove URLs
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+
+    # Remove Twitter/X mentions
+    text = re.sub(r"@\w+", " ", text)
+
+    # Convert hashtags: #earthquake -> earthquake
+    text = re.sub(r"#(\w+)", r"\1", text)
+
+    # Remove common social media prefixes
+    text = re.sub(r"\brt\b", " ", text)
+    
+
+    # Keep letters, numbers, decimal points, and useful punctuation
+    text = re.sub(r"[^a-z0-9\s\.\-]", " ", text)
+
+    # Normalize spaces
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+from models import (
+    CLIP_MODEL_ID,
+    MAX_TEXT_LEN,
+    INFORMATIVE_LABELS,
+    HUMANITARIAN_LABELS,
+    DAMAGE_LABELS,
+    load_informativeness_model,
+    load_humanitarian_model,
+    load_damage_model,
+)
+from xai import compute_explanations, overlay_saliency
+import style
+
+st.set_page_config(page_title="Crisis-CLIP", layout="wide", page_icon="🛰️")
+st.markdown(style.CUSTOM_CSS, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Cached resources
+# ---------------------------------------------------------------------------
+
+@st.cache_resource(show_spinner=False)
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+@st.cache_resource(show_spinner="Loading CLIP processor...")
+def get_processor():
+    return CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
+
+
+@st.cache_resource(show_spinner="Loading informativeness model...")
+def get_informativeness_model(ckpt_path, _device):
+    return load_informativeness_model(ckpt_path, _device)
+
+
+@st.cache_resource(show_spinner="Loading humanitarian-category model...")
+def get_humanitarian_model(ckpt_path, _device):
+    return load_humanitarian_model(ckpt_path, _device)
+
+
+@st.cache_resource(show_spinner="Loading damage-severity model...")
+def get_damage_model(ckpt_path, _device):
+    return load_damage_model(ckpt_path, _device)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — checkpoint paths & options
+# ---------------------------------------------------------------------------
+
+st.sidebar.markdown("## Model checkpoints")
+info_ckpt = st.sidebar.text_input("Informativeness .pth", "checkpoints/best_informativeness_lora.pth")
+human_ckpt = st.sidebar.text_input("Humanitarian (LoRA) .pth", "checkpoints/best_humanitarian_enhanced_lora.pth")
+damage_ckpt = st.sidebar.text_input("Damage severity (LoRA) .pth", "checkpoints/best_damage_model.pth")
+
+st.sidebar.markdown("## Options")
+force_continue = st.sidebar.checkbox(
+    "Always run humanitarian/damage models (ignore informativeness gate)", value=False
+)
+show_xai = st.sidebar.checkbox("Show Grad-CAM + token importance", value=True)
+
+st.sidebar.caption(
+    "Place your three trained .pth files anywhere on disk and point these "
+    "fields at them. Models load once and are cached."
+)
+
+device = get_device()
+st.sidebar.markdown(f'<span class="cc-latency">Device: {device}</span>', unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+    <div class="cc-eyebrow" style="color:#8A93A6;">CRISIS-CLIP · MULTIMODAL DISASTER ANALYSIS</div>
+    <h1 style="margin-top:0;">Read the signal in a single post</h1>
+    <p style="color:#8A93A6; max-width:640px; margin-top:-0.5rem;">
+        Upload an image and its caption. Three CLIP-based classifiers run in
+        sequence — informativeness, humanitarian category, damage severity —
+        each with a live Grad-CAM and text-token explanation of its call.
+    </p>
+    """,
+    unsafe_allow_html=True,
+)
+
+col_input1, col_input2 = st.columns([1, 1])
+with col_input1:
+    uploaded_image = st.file_uploader("Image", type=["jpg", "jpeg", "png"])
+with col_input2:
+    text_input = st.text_area("Caption / tweet text", height=150, placeholder="e.g. Streets flooded near downtown, several homes damaged.")
+
+run_button = st.button("Analyze", type="primary", use_container_width=True)
+
+
+def predict(model, ids, mask, pix):
+    with torch.no_grad():
+        logits = model(ids.unsqueeze(0).to(device), mask.unsqueeze(0).to(device), pix.unsqueeze(0).to(device))
+        probs = torch.softmax(logits, dim=-1).cpu().numpy().squeeze(0)
+    pred = int(probs.argmax())
+    return pred, probs
+
+
+def show_probs(labels_map, probs):
+    """Renders custom Beacon-gradient bars (sorted high to low) instead of st.progress."""
+    order = np.argsort(-probs)
+    rows = [(labels_map[idx], float(probs[idx])) for idx in order]
+    colors = []
+    for _, p in rows:
+        # interpolate along the Beacon gradient by rank confidence
+        rgba = style.BEACON_CMAP(0.15 + 0.7 * p)
+        colors.append("#%02X%02X%02X" % tuple(int(c * 255) for c in rgba[:3]))
+    st.markdown(style.render_prob_bars(rows, colors), unsafe_allow_html=True)
+
+
+def plot_token_beeswarm(tokens, contrib_per_dim, activation_per_dim, max_tokens=10):
+    """
+    SHAP-beeswarm-style plot for a single (image, text) prediction.
+    Each row = one token. Each dot = one embedding dimension's signed
+    Gradient x Input contribution (x position), colored by that dimension's
+    activation strength — the closest honest analogue to a SHAP summary plot
+    for a single instance, since a true beeswarm needs many samples per
+    feature and here we only have one.
+    """
+    total_abs = np.abs(contrib_per_dim).sum(axis=1)
+    order = np.argsort(-total_abs)[:max_tokens]
+    order = order[::-1]  # most important token ends up at the top
+
+    fig, ax = plt.subplots(figsize=(7, max(2.5, 0.45 * len(order))))
+    norm = plt.Normalize(vmin=np.percentile(activation_per_dim, 5), vmax=np.percentile(activation_per_dim, 95))
+    cmap = style.BEACON_CMAP
+
+    rng = np.random.default_rng(0)
+    for row, tok_idx in enumerate(order):
+        x = contrib_per_dim[tok_idx]
+        c = activation_per_dim[tok_idx]
+        jitter = rng.uniform(-0.35, 0.35, size=len(x))
+        ax.scatter(x, np.full_like(x, row) + jitter, c=c, cmap=cmap, norm=norm, s=12, alpha=0.75, linewidths=0)
+
+    ax.axvline(0, color=style.PAPER_BORDER, linewidth=1)
+    ax.set_yticks(range(len(order)))
+    ax.set_yticklabels([tokens[i] for i in order], fontfamily="monospace")
+    ax.set_xlabel("Gradient × Input contribution")
+    ax.set_title("Text token attribution", loc="left", fontsize=11, fontweight="bold")
+    style.apply_chart_style(fig, ax)
+    ax.grid(axis="x", color=style.PAPER_BORDER, linewidth=0.7, alpha=0.7)
+    ax.grid(axis="y", visible=False)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.outline.set_visible(False)
+    cbar.set_label("Embedding activation", color=style.PAPER_TEXT_MUTED, fontsize=8.5)
+    cbar.set_ticks([norm.vmin, norm.vmax])
+    cbar.set_ticklabels(["Low", "High"])
+    cbar.ax.tick_params(colors=style.PAPER_TEXT_MUTED, labelsize=8)
+
+    fig.tight_layout()
+    return fig
+
+
+def show_xai_panel(model, tokenizer, ids, mask, pix, pil_image, pred_class, container):
+    result = compute_explanations(model, tokenizer, ids, mask, pix, device, target_class=pred_class)
+    grid = result["grid"]
+    tokens = result["tokens"]
+    importance = result["importance"]
+    contrib_per_dim = result["contrib_per_dim"]
+    activation_per_dim = result["activation_per_dim"]
+
+    overlay = overlay_saliency(pil_image, grid, cmap=style.BEACON_CMAP)
+
+    container.markdown(
+        '<div class="cc-eyebrow" style="margin-top:0.5rem;">WHY THIS PREDICTION</div>',
+        unsafe_allow_html=True,
+    )
+    c1, c2 = container.columns([1, 1])
+
+    c1.image(overlay, caption="Grad-CAM — image regions driving the prediction", use_container_width=True)
+
+    fig, ax = plt.subplots(figsize=(max(4, len(tokens) * 0.45), 3))
+    bar_colors = [style.BEACON_CMAP(0.15 + 0.75 * v) for v in importance]
+    ax.bar(range(len(tokens)), importance, color=bar_colors)
+    ax.set_xticks(range(len(tokens)))
+    ax.set_xticklabels(tokens, rotation=75, fontsize=8, fontfamily="monospace")
+    ax.set_ylabel("Saliency")
+    ax.set_title("Text token importance", loc="left", fontsize=11, fontweight="bold")
+    ax.set_ylim(0, 1.05)
+    style.apply_chart_style(fig, ax)
+    fig.tight_layout()
+    c2.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    # SHAP-beeswarm-style view of the same text attribution, full width
+    beeswarm_fig = plot_token_beeswarm(tokens, contrib_per_dim, activation_per_dim)
+    container.pyplot(beeswarm_fig, use_container_width=True)
+    plt.close(beeswarm_fig)
+
+    # Plain-language summary so the "why" isn't only visual
+    if len(tokens) > 0:
+        top_k = min(3, len(tokens))
+        top_idx = np.argsort(-importance)[:top_k]
+        top_words = [tokens[i] for i in top_idx if importance[i] > 0]
+        if top_words:
+            container.markdown(
+                f'<span class="cc-latency">Most influential words: '
+                f'<b style="color:{style.INK_TEXT} !important;">{", ".join(top_words)}</b></span>',
+                unsafe_allow_html=True,
+            )
+
+
+if run_button:
+    if uploaded_image is None or not text_input.strip():
+        st.warning("Please provide both an image and some text.")
+        st.stop()
+
+    t0 = time.time()
+    pil_image = Image.open(uploaded_image).convert("RGB")
+    processor = get_processor()
+
+    cleaned_text = clean_social_text(text_input)
+
+    st.caption(f"Text used by model: {cleaned_text}")
+
+    encoding = processor(
+        text=[cleaned_text],
+        images=pil_image,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_TEXT_LEN,
+    )
+    ids = encoding["input_ids"].squeeze(0)
+    mask = encoding["attention_mask"].squeeze(0)
+    pix = encoding["pixel_values"].squeeze(0)
+
+    st.image(pil_image, caption="Input image", width=320)
+
+    # --- Stage 1: Informativeness -------------------------------------------------
+    try:
+        info_model = get_informativeness_model(info_ckpt, device)
+    except Exception as e:
+        st.error(f"Could not load informativeness checkpoint at `{info_ckpt}`: {e}")
+        st.stop()
+
+    info_pred, info_probs = predict(info_model, ids, mask, pix)
+    is_informative = info_pred == 1
+    strip_color = style.result_color(0.0 if is_informative else 1.0)
+
+    st.markdown(style.card_open("STAGE 1 / 3", "Informativeness", strip_color), unsafe_allow_html=True)
+    show_probs(INFORMATIVE_LABELS, info_probs)
+    if show_xai:
+        show_xai_panel(info_model, processor.tokenizer, ids, mask, pix, pil_image, info_pred, st)
+    st.markdown(style.card_close(), unsafe_allow_html=True)
+
+    if not is_informative and not force_continue:
+        st.info(
+            "Predicted **Not Informative** — humanitarian category and damage "
+            "severity are skipped (this mirrors the CrisisMMD task design). "
+            "Tick the sidebar override to run them anyway."
+        )
+        st.markdown(f'<span class="cc-latency">Total latency: {(time.time() - t0)*1000:.0f} ms</span>', unsafe_allow_html=True)
+        st.stop()
+
+    # --- Stage 2: Humanitarian category ---------------------------------------
+    try:
+        human_model = get_humanitarian_model(human_ckpt, device)
+    except Exception as e:
+        st.error(f"Could not load humanitarian checkpoint at `{human_ckpt}`: {e}")
+        st.stop()
+
+    human_pred, human_probs = predict(human_model, ids, mask, pix)
+    not_humanitarian_idx = 2  # "Not Humanitarian" class index
+    human_severity = 0.15 if human_pred == not_humanitarian_idx else 0.55
+    st.markdown(style.card_open("STAGE 2 / 3", "Humanitarian Category", style.result_color(human_severity)), unsafe_allow_html=True)
+    show_probs(HUMANITARIAN_LABELS, human_probs)
+    if show_xai:
+        show_xai_panel(human_model, processor.tokenizer, ids, mask, pix, pil_image, human_pred, st)
+    st.markdown(style.card_close(), unsafe_allow_html=True)
+
+    # --- Stage 3: Damage severity ----------------------------------------------
+    try:
+        damage_model = get_damage_model(damage_ckpt, device)
+    except Exception as e:
+        st.error(f"Could not load damage-severity checkpoint at `{damage_ckpt}`: {e}")
+        st.stop()
+
+    damage_pred, damage_probs = predict(damage_model, ids, mask, pix)
+    damage_severity_map = {0: 1.0, 1: 0.5, 2: 0.05}  # Severe / Mild / None
+    st.markdown(style.card_open("STAGE 3 / 3", "Damage Severity", style.result_color(damage_severity_map.get(damage_pred, 0.5))), unsafe_allow_html=True)
+    show_probs(DAMAGE_LABELS, damage_probs)
+    if show_xai:
+        show_xai_panel(damage_model, processor.tokenizer, ids, mask, pix, pil_image, damage_pred, st)
+    st.markdown(style.card_close(), unsafe_allow_html=True)
+
+    st.markdown(
+        f'<span class="cc-latency">✓ Done — total latency: {(time.time() - t0)*1000:.0f} ms</span>',
+        unsafe_allow_html=True,
+    )
