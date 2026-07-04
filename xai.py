@@ -86,6 +86,24 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         probs           - full class-probability vector (numpy)
     Works for MultimodalDisasterClassifier, HumanitarianVLM(mode="lora"), and
     the LoRA-wrapped DamageSeverityClassifier.
+
+    Text saliency is computed from the SECOND-TO-LAST text encoder layer's
+    hidden states (not the raw embedding table, and not the very last layer).
+    Hooking the embedding table means captured activations are identical for
+    a given input text regardless of which classifier head is attached (pure
+    embedding lookup, upstream of all task-specific computation), which is
+    why attributions looked nearly identical across the informativeness /
+    humanitarian / damage models. Hooking the LAST layer instead causes a
+    different problem: CLIP's text pooling reads only the EOT token's hidden
+    state from the final layer, so every other position in that tensor has
+    no computational path to the loss and gets ~zero gradient — once EOT
+    itself is filtered out as a special token, every remaining token shows
+    a flat, near-zero attribution. The second-to-last layer avoids both
+    issues: it's already been shaped by several attention layers (so it's
+    task-relevant, unlike the embedding table), and the final layer's
+    self-attention still mixes every position's representation into EOT's
+    output during the forward pass, so gradient flows back into all real
+    tokens here (unlike hooking the last layer directly).
     """
     clip_model = get_clip_submodule(model)
     unfreeze_params, saved_flags = _enable_explain_grad(clip_model)
@@ -102,11 +120,20 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         captured["vision_hidden"] = hidden
 
     def text_hook(module, inp, out):
-        out.retain_grad()
-        captured["text_emb"] = out
+        hidden = out[0] if isinstance(out, tuple) else out
+        hidden.retain_grad()
+        captured["text_hidden"] = hidden
 
     h1 = clip_model.vision_model.encoder.layers[-1].register_forward_hook(vision_hook)
-    h2 = clip_model.text_model.embeddings.token_embedding.register_forward_hook(text_hook)
+    # Hook the SECOND-TO-LAST text encoder layer, not the last one. CLIP's
+    # text pooling reads only the EOT token's hidden state from the final
+    # layer's output — so every other position in that tensor has no
+    # computational path to the loss and gets ~zero gradient (a flat-line
+    # attribution once EOT itself is filtered out as a special token). One
+    # layer earlier, the final layer's self-attention still mixes every
+    # token's representation into EOT's output, so gradient flows back into
+    # all real tokens here.
+    h2 = clip_model.text_model.encoder.layers[-2].register_forward_hook(text_hook)
 
     was_training = model.training
     try:
@@ -134,28 +161,39 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
     grid = weights[: n * n].reshape(n, n).detach().cpu().numpy()
     grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
 
-    # --- text saliency (gradient-norm per token embedding) ---
-    t_emb = captured["text_emb"]
-    t_grad = t_emb.grad
+    # --- text saliency (gradient-norm per token, from the second-to-last encoder layer) ---
+    t_hidden = captured["text_hidden"]
+    t_grad = t_hidden.grad
     importance = t_grad.norm(dim=-1).squeeze(0).detach().cpu().numpy()
 
-    # Per-dimension signed Gradient x Input decomposition. Summing this over
-    # the embedding axis for a given token recovers a signed version of that
-    # token's contribution (unlike `importance` above, which is magnitude-only
-    # via the gradient norm). Each dimension's value becomes one "point" in a
-    # SHAP-beeswarm-style plot for that token: x = signed contribution,
-    # color = that dimension's raw activation (high/low), one dot per
-    # embedding dimension standing in for "one sample" in the swarm.
-    contrib_per_dim = (t_grad * t_emb).squeeze(0).detach().cpu().numpy()  # (seq_len, embed_dim)
-    activation_per_dim = t_emb.squeeze(0).detach().cpu().numpy()  # (seq_len, embed_dim)
+    # Per-dimension signed Gradient x Input decomposition, taken at the
+    # second-to-last text encoder layer so it reflects post-attention,
+    # task-relevant representations while still receiving nonzero gradient
+    # at every real token position (see note above on why the last layer
+    # doesn't work). Summing this over the embedding axis for a given token recovers a signed version of
+    # that token's contribution (unlike `importance` above, which is
+    # magnitude-only via the gradient norm). Each dimension's value becomes
+    # one "point" in a SHAP-beeswarm-style plot for that token: x = signed
+    # contribution, color = that dimension's raw activation (high/low), one
+    # dot per embedding dimension standing in for "one sample" in the swarm.
+    contrib_per_dim = (t_grad * t_hidden).squeeze(0).detach().cpu().numpy()  # (seq_len, hidden_dim)
+    activation_per_dim = t_hidden.squeeze(0).detach().cpu().numpy()  # (seq_len, hidden_dim)
 
-    tok_mask = mask.squeeze(0).cpu().numpy().astype(bool)
+    # Drop padding (via attention_mask) AND special tokens (BOS/EOS/etc, via
+    # the tokenizer's special-token IDs) — attention_mask alone only removes
+    # padding, since CLIP marks BOS/EOS with attention_mask=1.
+    attn_mask_np = mask.squeeze(0).cpu().numpy().astype(bool)
     token_ids = ids.squeeze(0).cpu().tolist()
+    special_ids = set(tokenizer.all_special_ids)
+    keep_mask = np.array(
+        [is_attended and (tid not in special_ids) for tid, is_attended in zip(token_ids, attn_mask_np)]
+    )
+
     tokens = tokenizer.convert_ids_to_tokens(token_ids)
-    tokens = [t for t, m in zip(tokens, tok_mask) if m]
-    importance = importance[tok_mask]
-    contrib_per_dim = contrib_per_dim[tok_mask]
-    activation_per_dim = activation_per_dim[tok_mask]
+    tokens = [t for t, k in zip(tokens, keep_mask) if k]
+    importance = importance[keep_mask]
+    contrib_per_dim = contrib_per_dim[keep_mask]
+    activation_per_dim = activation_per_dim[keep_mask]
 
     imp_range = importance.max() - importance.min()
     if imp_range < 1e-8:
@@ -170,6 +208,6 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         "importance": importance,
         "pred_class": pred_class,
         "probs": probs.detach().cpu().numpy().squeeze(0),
-        "contrib_per_dim": contrib_per_dim,       # (num_tokens, embed_dim) signed, for beeswarm x
-        "activation_per_dim": activation_per_dim,  # (num_tokens, embed_dim) for beeswarm color
+        "contrib_per_dim": contrib_per_dim,       # (num_tokens, hidden_dim) signed, for beeswarm x
+        "activation_per_dim": activation_per_dim,  # (num_tokens, hidden_dim) for beeswarm color
     }
