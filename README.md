@@ -21,19 +21,13 @@ pip install -r requirements.txt
 (First run will download `openai/clip-vit-base-patch32` from Hugging Face —
 make sure you have internet access the first time.)
 
-## 2. Add your checkpoints
-
-Drop your three trained `.pth` files anywhere on disk — the default paths
-the app looks for are:
+## 2. checkpoints
 
 ```
 checkpoints/informativeness.pth      # MultimodalDisasterClassifier state_dict
 checkpoints/humanitarian_lora.pth    # HumanitarianVLM(mode="lora") state_dict
 checkpoints/damage_lora.pth          # get_peft_model(DamageSeverityClassifier(), lora_cfg) state_dict
 ```
-
-You can also just paste different paths into the sidebar at runtime — no
-need to rename your files.
 
 ## 3. Run
 
@@ -58,8 +52,8 @@ Upload an image, type a caption, click **Analyze**.
   force all three models to run regardless.
 - **LoRA configs must match training exactly.** `models.py` hard-codes the
   `LoraConfig` values read out of your notebooks (`r=128, lora_alpha=256,
-  target_modules=["q_proj","v_proj"]`, plus `modules_to_save=["fusion",
-  "classifier"]` for the damage model). If you retrain with different LoRA
+target_modules=["q_proj","v_proj"]`, plus `modules_to_save=["fusion",
+"classifier"]` for the damage model). If you retrain with different LoRA
   hyperparameters, update `HUMANITARIAN_LORA_CONFIG` / `DAMAGE_LORA_CONFIG`
   to match, or `load_state_dict` will fail.
 - Architecture + save/load logic (including the PEFT `modules_to_save`
