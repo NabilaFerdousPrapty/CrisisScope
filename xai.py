@@ -76,6 +76,7 @@ def overlay_saliency(pil_image, grid, cmap=None, alpha=0.45):
 
     return Image.fromarray(overlay)
 
+
 def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_values, device, target_class=None):
     """
     Runs one forward+backward pass and returns:
@@ -87,23 +88,32 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
     Works for MultimodalDisasterClassifier, HumanitarianVLM(mode="lora"), and
     the LoRA-wrapped DamageSeverityClassifier.
 
-    Text saliency is computed from the SECOND-TO-LAST text encoder layer's
-    hidden states (not the raw embedding table, and not the very last layer).
-    Hooking the embedding table means captured activations are identical for
-    a given input text regardless of which classifier head is attached (pure
-    embedding lookup, upstream of all task-specific computation), which is
-    why attributions looked nearly identical across the informativeness /
-    humanitarian / damage models. Hooking the LAST layer instead causes a
-    different problem: CLIP's text pooling reads only the EOT token's hidden
-    state from the final layer, so every other position in that tensor has
-    no computational path to the loss and gets ~zero gradient — once EOT
-    itself is filtered out as a special token, every remaining token shows
-    a flat, near-zero attribution. The second-to-last layer avoids both
-    issues: it's already been shaped by several attention layers (so it's
-    task-relevant, unlike the embedding table), and the final layer's
-    self-attention still mixes every position's representation into EOT's
-    output during the forward pass, so gradient flows back into all real
-    tokens here (unlike hooking the last layer directly).
+    Both the vision and text saliency hooks target the SECOND-TO-LAST encoder
+    layer in their respective towers (not the raw embedding table, and not
+    the very last layer). Two different failure modes motivate this:
+
+    - Hooking an EMBEDDING TABLE (vision patch-embed or text token-embed)
+      means captured activations are identical for a given input regardless
+      of which classifier head is attached (pure embedding lookup, upstream
+      of all task-specific computation) -- attributions look nearly
+      identical across the informativeness / humanitarian / damage models.
+
+    - Hooking the LAST encoder layer's OUTPUT causes a different problem:
+      CLIP's pooling reads only ONE position from that output -- the CLS
+      token for vision, the EOT token for text. Every other position in
+      that output tensor has no computational path to the loss, so it gets
+      exactly zero gradient. Once that one pooled position is dropped (CLS
+      for vision saliency, EOT/special tokens for text saliency), every
+      remaining position shows a flat, all-zero attribution -- which is
+      exactly what an all-blue Grad-CAM overlay or a flat text-importance
+      bar chart looks like (jet colormap maps 0 -> dark blue).
+
+    The second-to-last layer avoids both issues: it's already been shaped by
+    several attention layers (so it's task-relevant, unlike an embedding
+    table), and the FINAL layer's self-attention still mixes every other
+    position's representation into the pooled token's (CLS/EOT) output
+    during the forward pass -- so real, non-zero gradient flows back into
+    every patch/token here, unlike hooking the last layer's output directly.
     """
     clip_model = get_clip_submodule(model)
     unfreeze_params, saved_flags = _enable_explain_grad(clip_model)
@@ -114,8 +124,14 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
 
     captured = {}
 
-    def vision_hook(module, inp, out):
-        hidden = out[0] if isinstance(out, tuple) else out
+    # Pre-hook on the LAST vision layer == hooking the SECOND-TO-LAST layer's
+    # output (its output is exactly this layer's input), same fix as the text
+    # side below. Capturing here (rather than layers[-1]'s output) is what
+    # keeps this from going all-blue: these patch tokens still feed into
+    # layers[-1]'s self-attention, which the CLS token attends to before
+    # being pooled, so they carry a real, non-zero gradient.
+    def vision_hook(module, inputs):
+        hidden = inputs[0] if isinstance(inputs, tuple) else inputs
         hidden.retain_grad()
         captured["vision_hidden"] = hidden
 
@@ -124,15 +140,12 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         hidden.retain_grad()
         captured["text_hidden"] = hidden
 
-    h1 = clip_model.vision_model.encoder.layers[-1].register_forward_hook(vision_hook)
-    # Hook the SECOND-TO-LAST text encoder layer, not the last one. CLIP's
-    # text pooling reads only the EOT token's hidden state from the final
-    # layer's output — so every other position in that tensor has no
-    # computational path to the loss and gets ~zero gradient (a flat-line
-    # attribution once EOT itself is filtered out as a special token). One
-    # layer earlier, the final layer's self-attention still mixes every
-    # token's representation into EOT's output, so gradient flows back into
-    # all real tokens here.
+    # FIX: forward_pre_hook (captures INPUT) instead of forward_hook (captures
+    # OUTPUT) on the last vision encoder layer. See docstring above.
+    h1 = clip_model.vision_model.encoder.layers[-1].register_forward_pre_hook(vision_hook)
+    # Text side was already using the correct pattern: hook the SECOND-TO-LAST
+    # layer's OUTPUT directly (equivalent fix, different mechanics -- either
+    # "layers[-2] output" or "layers[-1] input" gets you the same tensor).
     h2 = clip_model.text_model.encoder.layers[-2].register_forward_hook(text_hook)
 
     was_training = model.training
@@ -152,13 +165,25 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         if was_training:
             model.train()
 
-    # --- vision saliency (Grad-CAM style on last ViT layer's patch tokens) ---
+    # --- vision saliency (Grad-CAM style, patch tokens from second-to-last layer) ---
     v_hidden = captured["vision_hidden"]
     v_grad = v_hidden.grad
+    if v_grad is None:
+        raise RuntimeError(
+            "vision_hidden.grad is None -- the pre-hook isn't capturing a tensor "
+            "that's actually used downstream. Double-check register_forward_pre_hook "
+            "is attached to clip_model.vision_model.encoder.layers[-1] and that "
+            "`pix` has requires_grad_(True)."
+        )
     weights = (v_grad * v_hidden).sum(-1).squeeze(0)[1:]  # drop CLS token
     weights = F.relu(weights)
     n = int(weights.numel() ** 0.5)
     grid = weights[: n * n].reshape(n, n).detach().cpu().numpy()
+
+    if grid.std() < 1e-8:
+        print(f"[warn] vision grid is flat (std={grid.std():.2e}) -- Grad-CAM will "
+              "render as a uniform color regardless of colormap. Gradient still "
+              "isn't reaching the patch tokens.")
     grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
 
     # --- text saliency (gradient-norm per token, from the second-to-last encoder layer) ---
