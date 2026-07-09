@@ -258,8 +258,14 @@ def show_xai_panel(model, tokenizer, ids, mask, pix, pil_image, pred_class, cont
     contrib_per_dim = result["contrib_per_dim"]
     activation_per_dim = result["activation_per_dim"]
 
-    overlay = overlay_saliency(pil_image, grid, cmap=style.BEACON_CMAP)
-
+    overlay = overlay_saliency(pil_image, grid)  # jet default -> real heatmap colors, not the brand palette
+    # container.code(
+    #     f"grid shape        : {grid.shape}\n"
+    #     f"grid min/max/std  : {grid.min():.6f} / {grid.max():.6f} / {grid.std():.6f}\n"
+    #     f"pred_class        : {pred_class}\n"
+    #     f"probs             : {result['probs']}\n"
+    #     f"import path       : {compute_explanations.__module__} -> {compute_explanations.__code__.co_filename}\n"
+    # )
     container.markdown(
         '<div class="cc-eyebrow" style="margin-top:0.5rem;">WHY THIS PREDICTION</div>',
         unsafe_allow_html=True,

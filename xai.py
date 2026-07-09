@@ -45,9 +45,31 @@ def _restore_explain_grad(params, saved):
         p.requires_grad_(flag)
 
 
-def overlay_saliency(pil_image, grid, cmap=None, alpha=0.45):
+def overlay_saliency(pil_image, grid, cmap=None, alpha=0.8, min_alpha=0.45, gamma=0.7):
+    """
+    Blend a (small, coarse) saliency grid over the original image as a
+    Grad-CAM style heatmap.
+
+    Default colormap is "turbo" -- a modern, perceptually-improved rainbow
+    colormap (Google AI, 2019) that has largely replaced "jet" as the
+    standard for heatmaps/Grad-CAM in recent papers. It keeps jet's
+    intuitive blue(cold)->red(hot) reading but avoids jet's washed-out,
+    perceptually flat green/yellow midsection and hard banding -- so the
+    same underlying saliency values look more vivid and easier to read at a
+    glance. Pass cmap=plt.get_cmap("jet") explicitly if you specifically
+    want the classic look instead.
+
+    - alpha / min_alpha: per-pixel alpha floor + ceiling so every pixel gets
+      *some* color, ramping up toward `alpha` at the hottest point -- full
+      coverage instead of leaving cold regions untinted.
+    - gamma < 1.0 pushes mid-range saliency values toward the vivid ends of
+      the colormap via `heatmap ** gamma`. Purely a display curve.
+    - A light Gaussian blur is applied AFTER upsampling the coarse grid to
+      full image resolution, so the heatmap reads as a smooth blob instead
+      of visible blocky patch edges.
+    """
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageFilter
     import matplotlib.pyplot as plt
 
     image = pil_image.convert("RGB")
@@ -60,18 +82,31 @@ def overlay_saliency(pil_image, grid, cmap=None, alpha=0.45):
     else:
         grid = np.zeros_like(grid)
 
-    heatmap = Image.fromarray(np.uint8(grid * 255)).resize(
+    heatmap_img = Image.fromarray(np.uint8(grid * 255)).resize(
         image.size,
-        resample=Image.BILINEAR
+        resample=Image.BICUBIC,
     )
-    heatmap = np.array(heatmap).astype(np.float32) / 255.0
+    blur_radius = max(image.size) / max(grid.shape) * 0.5
+    heatmap_img = heatmap_img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    heatmap = np.array(heatmap_img).astype(np.float32) / 255.0   # (H, W) in [0, 1]
+    heatmap = np.clip(heatmap, 0.0, 1.0)
+
+    heatmap_display = heatmap ** gamma
 
     if cmap is None:
-        cmap = plt.get_cmap("jet")
+        try:
+            cmap = plt.get_cmap("turbo")
+        except ValueError:
+            # older matplotlib versions (<3.3) don't ship "turbo" -- fall
+            # back to jet, which is always available.
+            cmap = plt.get_cmap("jet")
 
-    heatmap_rgb = cmap(heatmap)[..., :3]
+    heatmap_rgb = cmap(heatmap_display)[..., :3]              # (H, W, 3)
 
-    overlay = (1 - alpha) * image_np + alpha * heatmap_rgb
+    alpha_map = (min_alpha + (alpha - min_alpha) * heatmap)[..., None]  # (H, W, 1)
+
+    overlay = (1 - alpha_map) * image_np + alpha_map * heatmap_rgb
     overlay = np.clip(overlay * 255, 0, 255).astype(np.uint8)
 
     return Image.fromarray(overlay)
@@ -104,9 +139,7 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
       that output tensor has no computational path to the loss, so it gets
       exactly zero gradient. Once that one pooled position is dropped (CLS
       for vision saliency, EOT/special tokens for text saliency), every
-      remaining position shows a flat, all-zero attribution -- which is
-      exactly what an all-blue Grad-CAM overlay or a flat text-importance
-      bar chart looks like (jet colormap maps 0 -> dark blue).
+      remaining position shows a flat, all-zero attribution.
 
     The second-to-last layer avoids both issues: it's already been shaped by
     several attention layers (so it's task-relevant, unlike an embedding
@@ -114,6 +147,22 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
     position's representation into the pooled token's (CLS/EOT) output
     during the forward pass -- so real, non-zero gradient flows back into
     every patch/token here, unlike hooking the last layer's output directly.
+
+    IMPORTANT: backprop is taken from the RAW LOGIT for the target class,
+    NOT from the post-softmax probability. This is the standard Grad-CAM
+    recipe (see the original Grad-CAM paper) and it matters a lot in
+    practice: as softmax probability for the winning class approaches 1.0
+    (a very confident, saturated prediction -- common in this disaster
+    classification setting, e.g. 0.99+ confidence on an obviously "Severe"
+    image), the GRADIENT of that probability w.r.t. earlier layers vanishes
+    toward zero, because softmax's derivative flattens out near its
+    extremes. Backprop through `probs[0, cls]` on a confident prediction can
+    therefore produce a saliency map that's silently all-zero (no error,
+    just a flat grid -> a blank/invisible heatmap once rendered), even
+    though the model's underlying logits encode a perfectly good, non-flat
+    pattern. Backprop through the raw `logits[0, cls]` instead sidesteps
+    this entirely, since logits aren't bounded/saturated the way a softmax
+    output is.
     """
     clip_model = get_clip_submodule(model)
     unfreeze_params, saved_flags = _enable_explain_grad(clip_model)
@@ -125,11 +174,11 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
     captured = {}
 
     # Pre-hook on the LAST vision layer == hooking the SECOND-TO-LAST layer's
-    # output (its output is exactly this layer's input), same fix as the text
-    # side below. Capturing here (rather than layers[-1]'s output) is what
-    # keeps this from going all-blue: these patch tokens still feed into
-    # layers[-1]'s self-attention, which the CLS token attends to before
-    # being pooled, so they carry a real, non-zero gradient.
+    # output (its output is exactly this layer's input). Capturing here
+    # (rather than layers[-1]'s output) is what keeps this from going
+    # all-blue: these patch tokens still feed into layers[-1]'s
+    # self-attention, which the CLS token attends to before being pooled,
+    # so they carry a real, non-zero gradient.
     def vision_hook(module, inputs):
         hidden = inputs[0] if isinstance(inputs, tuple) else inputs
         hidden.retain_grad()
@@ -140,12 +189,7 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         hidden.retain_grad()
         captured["text_hidden"] = hidden
 
-    # FIX: forward_pre_hook (captures INPUT) instead of forward_hook (captures
-    # OUTPUT) on the last vision encoder layer. See docstring above.
     h1 = clip_model.vision_model.encoder.layers[-1].register_forward_pre_hook(vision_hook)
-    # Text side was already using the correct pattern: hook the SECOND-TO-LAST
-    # layer's OUTPUT directly (equivalent fix, different mechanics -- either
-    # "layers[-2] output" or "layers[-1] input" gets you the same tensor).
     h2 = clip_model.text_model.encoder.layers[-2].register_forward_hook(text_hook)
 
     was_training = model.training
@@ -156,7 +200,12 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         probs = F.softmax(logits, dim=-1)
         pred_class = int(probs.argmax(-1).item())
         cls = target_class if target_class is not None else pred_class
-        score = probs[0, cls]
+
+        # FIX: backprop from the raw logit, not the softmax probability.
+        # See the docstring note above -- this is what was silently
+        # producing an all-zero grid (and therefore an invisible/blank
+        # Grad-CAM overlay) on high-confidence predictions.
+        score = logits[0, cls]
         score.backward()
     finally:
         h1.remove()
@@ -182,8 +231,10 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
 
     if grid.std() < 1e-8:
         print(f"[warn] vision grid is flat (std={grid.std():.2e}) -- Grad-CAM will "
-              "render as a uniform color regardless of colormap. Gradient still "
-              "isn't reaching the patch tokens.")
+              "render as a uniform color regardless of colormap. If this still "
+              "fires after the logit fix, the prediction may be so saturated "
+              "that even the raw logit's gradient underflows -- check raw "
+              "logits[0, cls].item() to see how large/small the margin is.")
     grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
 
     # --- text saliency (gradient-norm per token, from the second-to-last encoder layer) ---
