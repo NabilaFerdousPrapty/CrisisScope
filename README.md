@@ -67,7 +67,7 @@ target_modules=["q_proj","v_proj"]`, plus `modules_to_save=["fusion",
 - `app.py` — Streamlit UI + pipeline orchestration
 - `models.py` — the exact model classes + checkpoint loaders
 - `xai.py` — Grad-CAM + text-token saliency (generalized from your
-  `compute_explanations` function so it works across all three models)
+
 - `requirements.txt`
 - `style.py` - Contains styles of the web app
 
