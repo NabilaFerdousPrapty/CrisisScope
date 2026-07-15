@@ -59,7 +59,11 @@ from models import (
 from xai import compute_explanations, overlay_saliency
 import style
 
-st.set_page_config(page_title="Crisis-CLIP", layout="wide", page_icon="🛰️")
+st.set_page_config(
+    page_title="CrisisCLIP-X | Explainable Disaster AI",
+    layout="wide",
+    page_icon="🛰️"
+)
 st.markdown(style.CUSTOM_CSS, unsafe_allow_html=True)
 
 
@@ -122,12 +126,20 @@ st.sidebar.markdown(f'<span class="cc-latency">Device: {device}</span>', unsafe_
 
 st.markdown(
     """
-    <div class="cc-eyebrow" style="color:#8A93A6;">CRISIS-CLIP · MULTIMODAL DISASTER ANALYSIS</div>
-    <h1 style="margin-top:0;">Read the signal in a single post</h1>
-    <p style="color:#8A93A6; max-width:640px; margin-top:-0.5rem;">
-        Upload an image and its caption. Three CLIP-based classifiers run in
-        sequence — informativeness, humanitarian category, damage severity —
-        each with a live Grad-CAM and text-token explanation of its call.
+    <div class="cc-eyebrow" style="color:#8A93A6;">
+    CRISISCLIP-X · EXPLAINABLE MULTIMODAL DISASTER INTELLIGENCE
+    </div>
+
+    <h1 style="margin-top:0;">
+    Transforming Disaster Posts into Actionable Information
+    </h1>
+
+    <p style="color:#8A93A6; max-width:720px; margin-top:-0.5rem;">
+    During disasters, social media provides rapid information but contains
+    large amounts of irrelevant content. CrisisCLIP-X analyzes both images
+    and text to identify informative posts, classify humanitarian relevance,
+    estimate damage severity, and explain decisions using visual and textual
+    evidence.
     </p>
     """,
     unsafe_allow_html=True,
@@ -135,12 +147,38 @@ st.markdown(
 
 col_input1, col_input2 = st.columns([1, 1])
 with col_input1:
-    uploaded_image = st.file_uploader("Image", type=["jpg", "jpeg", "png"])
+    uploaded_image = st.file_uploader(
+    "Upload Disaster Image (Visual Evidence)",
+    type=["jpg", "jpeg", "png"]
+)
 with col_input2:
-    text_input = st.text_area("Caption / tweet text", height=150, placeholder="e.g. Streets flooded near downtown, several homes damaged.")
+    text_input = st.text_area(
+    "Social Media Text (Contextual Evidence)",
+    height=150,
+    placeholder="Example: Streets flooded near downtown, several homes damaged."
+)
+run_button = st.button(
+    "Generate Disaster Intelligence Report",
+    type="primary",
+    use_container_width=True
+)
+st.markdown(
+"""
+### CrisisCLIP-X Decision Pipeline
 
-run_button = st.button("Analyze", type="primary", use_container_width=True)
+**Step 1 — Information Filtering**  
+Detect whether the social media post contains useful disaster-related information.
 
+**Step 2 — Humanitarian Understanding**  
+Identify affected individuals, infrastructure damage, rescue activities, or irrelevant content.
+
+**Step 3 — Damage Assessment**  
+Estimate disaster severity from combined image and text evidence.
+
+**Step 4 — Explainable Prediction**  
+Highlight important image regions and words responsible for the decision.
+"""
+)
 
 def predict(model, ids, mask, pix):
     with torch.no_grad():

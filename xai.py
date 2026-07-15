@@ -110,7 +110,18 @@ def overlay_saliency(pil_image, grid, cmap=None, alpha=0.8, min_alpha=0.45, gamm
     overlay = np.clip(overlay * 255, 0, 255).astype(np.uint8)
 
     return Image.fromarray(overlay)
-
+# ---------------------------------------------------------------------------
+# Explainable AI Module
+#
+# Motivation:
+# In disaster-response scenarios, prediction alone is insufficient.
+# Emergency decision makers need to understand why a model selected
+# a particular category or severity level.
+#
+# This module provides:
+# - Visual evidence through Grad-CAM style heatmaps
+# - Textual evidence through token attribution
+# ---------------------------------------------------------------------------
 
 def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_values, device, target_class=None):
     """
