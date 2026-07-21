@@ -6,6 +6,7 @@ wrappers (they all end up exposing a `.clip` CLIPModel, whether raw, LoRA, or
 LoRA-wrapping-a-classifier — PEFT proxies attribute access down to it).
 """
 
+import re
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -276,18 +277,74 @@ def compute_explanations(model, tokenizer, input_ids, attention_mask, pixel_valu
         [is_attended and (tid not in special_ids) for tid, is_attended in zip(token_ids, attn_mask_np)]
     )
 
-    tokens = tokenizer.convert_ids_to_tokens(token_ids)
-    tokens = [t for t, k in zip(tokens, keep_mask) if k]
+    raw_tokens = tokenizer.convert_ids_to_tokens(token_ids)
+    raw_tokens = [t for t, k in zip(raw_tokens, keep_mask) if k]
     importance = importance[keep_mask]
     contrib_per_dim = contrib_per_dim[keep_mask]
     activation_per_dim = activation_per_dim[keep_mask]
 
-    imp_range = importance.max() - importance.min()
-    if imp_range < 1e-8:
-        # all tokens got ~equal gradient — avoid 0/0 -> NaN bars that render invisibly
-        importance = np.zeros_like(importance)
+    # CLIP uses byte-pair tokens. Merge subword pieces back into complete words
+    # before ranking/displaying them, and drop punctuation-only groups. This
+    # prevents artifacts such as "." from being presented as an influential
+    # "word" and avoids outputs such as "dam" + "aged".
+    word_tokens = []
+    word_importance = []
+    word_contrib = []
+    word_activation = []
+
+    pieces = []
+    imp_parts = []
+    contrib_parts = []
+    activation_parts = []
+
+    def flush_word():
+        if not pieces:
+            return
+        word = "".join(piece.replace("</w>", "") for piece in pieces).strip()
+        # Keep only groups containing at least one letter or number.
+        if word and re.search(r"[a-z0-9]", word, flags=re.IGNORECASE):
+            word_tokens.append(word)
+            # Sum token sensitivities within a word; later normalization makes
+            # the scale comparable for plotting.
+            word_importance.append(float(np.sum(imp_parts)))
+            word_contrib.append(np.sum(contrib_parts, axis=0))
+            word_activation.append(np.mean(activation_parts, axis=0))
+        pieces.clear()
+        imp_parts.clear()
+        contrib_parts.clear()
+        activation_parts.clear()
+
+    for tok, imp, contrib, activation in zip(
+        raw_tokens, importance, contrib_per_dim, activation_per_dim
+    ):
+        pieces.append(tok)
+        imp_parts.append(imp)
+        contrib_parts.append(contrib)
+        activation_parts.append(activation)
+        if tok.endswith("</w>"):
+            flush_word()
+    flush_word()
+
+    tokens = word_tokens
+    importance = np.asarray(word_importance, dtype=np.float32)
+    if word_contrib:
+        contrib_per_dim = np.stack(word_contrib)
+        activation_per_dim = np.stack(word_activation)
     else:
-        importance = (importance - importance.min()) / imp_range
+        hidden_dim = contrib_per_dim.shape[-1]
+        contrib_per_dim = np.empty((0, hidden_dim), dtype=np.float32)
+        activation_per_dim = np.empty((0, hidden_dim), dtype=np.float32)
+
+    if importance.size == 0:
+        importance = np.empty((0,), dtype=np.float32)
+    else:
+        imp_range = importance.max() - importance.min()
+        if imp_range < 1e-8:
+            # Equal sensitivity is not evidence that every word is maximally
+            # important, so render a neutral all-zero vector.
+            importance = np.zeros_like(importance)
+        else:
+            importance = (importance - importance.min()) / imp_range
 
     return {
         "grid": grid,

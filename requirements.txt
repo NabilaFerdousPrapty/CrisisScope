@@ -6,3 +6,4 @@ peft>=0.10
 Pillow
 numpy
 matplotlib
+huggingface_hub
