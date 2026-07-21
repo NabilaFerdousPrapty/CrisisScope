@@ -14,6 +14,8 @@ slightly differently than during training, loading will fail or silently
 load into the wrong tensors.
 """
 
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -271,37 +273,78 @@ def build_damage_lora_model():
 # Checkpoint loading helpers
 # ---------------------------------------------------------------------------
 
-def load_informativeness_model(ckpt_path, device):
-    """
-    Auto-detects which informativeness architecture the checkpoint was saved
-    from: LoRA (informativeness_lora_train.py) or full fine-tune
-    (MultimodalDisasterClassifier). LoRA checkpoints contain "lora_A" in
-    their state_dict keys; full fine-tune checkpoints don't.
-    """
-    state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    is_lora = any("lora_A" in k for k in state.keys())
 
-    if is_lora:
-        model = InformativenessLoRAClassifier().to(device)
-    else:
-        model = MultimodalDisasterClassifier().to(device)
+def _read_checkpoint_state(ckpt_path):
+    """Load a checkpoint on CPU with lower peak memory where supported."""
+    load_kwargs = {
+        "map_location": "cpu",
+        "weights_only": True,
+    }
+    try:
+        state = torch.load(ckpt_path, mmap=True, **load_kwargs)
+    except (TypeError, RuntimeError, ValueError):
+        state = torch.load(ckpt_path, **load_kwargs)
 
-    model.load_state_dict(state)
+    # Support both a raw state_dict and common training-checkpoint wrappers.
+    if isinstance(state, dict):
+        for key in ("state_dict", "model_state_dict", "model"):
+            candidate = state.get(key)
+            if isinstance(candidate, dict):
+                state = candidate
+                break
+
+    if not isinstance(state, dict):
+        raise TypeError(
+            f"Checkpoint {ckpt_path!s} does not contain a PyTorch state_dict."
+        )
+
+    # DataParallel/DistributedDataParallel checkpoints often add "module.".
+    if state and all(isinstance(k, str) and k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+
+    return state
+
+
+def _load_state_and_finalize(model, state, device):
+    """Load weights, move to the selected device, and release checkpoint RAM."""
+    try:
+        model.load_state_dict(state, strict=True, assign=True)
+    except TypeError:
+        # `assign` is unavailable in older PyTorch releases.
+        model.load_state_dict(state, strict=True)
+
+    del state
+    gc.collect()
+
+    model = model.to(device)
     model.eval()
     return model
+
+
+def load_informativeness_model(ckpt_path, device):
+    """
+    Auto-detect which informativeness architecture produced the checkpoint.
+    LoRA checkpoints contain lora_A/lora_B keys; full fine-tune checkpoints do
+    not. The checkpoint is memory-mapped on CPU when PyTorch supports it.
+    """
+    state = _read_checkpoint_state(ckpt_path)
+    is_lora = any("lora_A" in key or "lora_B" in key for key in state)
+
+    if is_lora:
+        model = InformativenessLoRAClassifier()
+    else:
+        model = MultimodalDisasterClassifier()
+
+    return _load_state_and_finalize(model, state, device)
 
 
 def load_humanitarian_model(ckpt_path, device):
-    model = HumanitarianVLM(mode="lora").to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
-    return model
+    state = _read_checkpoint_state(ckpt_path)
+    model = HumanitarianVLM(mode="lora")
+    return _load_state_and_finalize(model, state, device)
 
 
 def load_damage_model(ckpt_path, device):
-    model = build_damage_lora_model().to(device)
-    state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()
-    return model
+    state = _read_checkpoint_state(ckpt_path)
+    model = build_damage_lora_model()
+    return _load_state_and_finalize(model, state, device)

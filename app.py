@@ -13,6 +13,7 @@ Run with:
     streamlit run app.py
 """
 
+import gc
 import os
 import time
 import re
@@ -25,7 +26,6 @@ import streamlit as st
 import torch
 from PIL import Image
 from transformers import CLIPProcessor
-from huggingface_hub import hf_hub_download
 
 def clean_social_text(text):
     text = text.lower()
@@ -64,6 +64,9 @@ from xai import compute_explanations, overlay_saliency
 import style
 
 
+APP_DIR = Path(__file__).resolve().parent
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint configuration
 # ---------------------------------------------------------------------------
@@ -92,20 +95,24 @@ CHECKPOINT_SOURCE_OPTIONS = (
 
 
 def get_hf_token():
-    """Return an optional Hugging Face token from environment or Streamlit secrets.
+    """Return an optional Hugging Face token without breaking app startup.
 
-    Public repositories do not require a token. For a private or gated model
-    repository, set HF_TOKEN in the deployment environment or in
-    .streamlit/secrets.toml. The token is never displayed in the interface.
+    Public repositories need no token. Streamlit versions differ in the
+    exception raised when no secrets file exists, so secrets access is fully
+    guarded and environment variables remain the first choice.
     """
     token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
     if token:
-        return token
+        return token.strip()
 
     try:
-        return st.secrets.get("HF_TOKEN")
-    except (FileNotFoundError, KeyError, AttributeError):
-        return None
+        token = st.secrets.get("HF_TOKEN", None)
+    except Exception:
+        # Older Streamlit versions may raise StreamlitSecretNotFoundError,
+        # while newer versions may raise FileNotFoundError.
+        token = None
+
+    return str(token).strip() if token else None
 
 
 def resolve_checkpoint(
@@ -127,7 +134,12 @@ def resolve_checkpoint(
     hub_filename = (hub_filename or "").strip()
     revision = (revision or HF_REVISION_DEFAULT).strip()
 
-    local_candidate = Path(local_path).expanduser() if local_path else None
+    if local_path:
+        local_candidate = Path(local_path).expanduser()
+        if not local_candidate.is_absolute():
+            local_candidate = APP_DIR / local_candidate
+    else:
+        local_candidate = None
     local_exists = bool(local_candidate and local_candidate.is_file())
 
     def use_local():
@@ -140,6 +152,13 @@ def resolve_checkpoint(
         return str(local_candidate.resolve()), f"Local file: {local_candidate}"
 
     def use_hub():
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise RuntimeError(
+                "The package `huggingface-hub` is missing. Add it to requirements.txt."
+            ) from exc
+
         if not repo_id:
             raise ValueError("The Hugging Face repository ID is empty.")
         if not hub_filename:
@@ -238,19 +257,35 @@ def get_processor():
     return CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
 
 
-@st.cache_resource(show_spinner="Loading informativeness model...")
-def get_informativeness_model(ckpt_path, _device):
-    return load_informativeness_model(ckpt_path, _device)
+def get_informativeness_model(ckpt_path, device):
+    # Do not cache full CLIP models on Community Cloud. Each stage is loaded,
+    # used, and released before the next model to avoid keeping three CLIP
+    # backbones in RAM simultaneously.
+    with st.spinner("Loading informativeness model..."):
+        return load_informativeness_model(ckpt_path, device)
 
 
-@st.cache_resource(show_spinner="Loading humanitarian-category model...")
-def get_humanitarian_model(ckpt_path, _device):
-    return load_humanitarian_model(ckpt_path, _device)
+def get_humanitarian_model(ckpt_path, device):
+    with st.spinner("Loading humanitarian-category model..."):
+        return load_humanitarian_model(ckpt_path, device)
 
 
-@st.cache_resource(show_spinner="Loading damage-severity model...")
-def get_damage_model(ckpt_path, _device):
-    return load_damage_model(ckpt_path, _device)
+def get_damage_model(ckpt_path, device):
+    with st.spinner("Loading damage-severity model..."):
+        return load_damage_model(ckpt_path, device)
+
+
+def release_model(model):
+    """Release one stage model before loading the next CLIP backbone."""
+    try:
+        model.to("cpu")
+    except Exception:
+        pass
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +817,8 @@ if run_button:
         stage_results["Informativeness"] = show_xai_panel(info_model, processor.tokenizer, cleaned_text, ids, mask, pix, pil_image, info_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
 
+    info_model = release_model(info_model)
+
     if not is_informative and not force_continue:
         st.info(
             "Predicted **Not Informative** — humanitarian category and damage "
@@ -819,6 +856,8 @@ if run_button:
         stage_results["Humanitarian"] = show_xai_panel(human_model, processor.tokenizer, cleaned_text, ids, mask, pix, pil_image, human_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
 
+    human_model = release_model(human_model)
+
     # --- Stage 3: Damage severity ----------------------------------------------
     resolved_damage_ckpt = resolve_checkpoint_or_stop(
         stage_name="Damage-severity",
@@ -845,6 +884,8 @@ if run_button:
     if show_xai:
         stage_results["Damage Severity"] = show_xai_panel(damage_model, processor.tokenizer, cleaned_text, ids, mask, pix, pil_image, damage_pred, st)
     st.markdown(style.card_close(), unsafe_allow_html=True)
+
+    damage_model = release_model(damage_model)
 
     if show_xai and len(stage_results) >= 2:
         st.markdown(style.card_open("DIAGNOSTIC", "Model Attribution Comparison", style.CURRENT), unsafe_allow_html=True)
